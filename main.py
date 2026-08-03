@@ -844,22 +844,28 @@ class TGStoriesApp(App):
             pass
 
     def request_perms(self):
+        """
+        بلا دالة رد نداء عمدًا.
+
+        تمرير callback إلى request_permissions يسجّل مستمعًا على جانب Java
+        ويستدعي بايثون من خيط أندرويد — وهو مسار JNI إضافي ينهار على بعض
+        الأجهزة انهيارًا أصليًا لا يلتقطه try/except. نطلب الإذن ثم نستطلع
+        النتيجة من خيط Kivy وحده.
+        """
         if not ON_ANDROID:
             return
         _log("perms: requesting")
         try:
             from android.permissions import Permission, request_permissions
-
-            def _granted(perms, results):
-                # request_permissions يرد على خيط أندرويد، لا خيط Kivy
-                _log("perms: results %s" % (results,))
-                Clock.schedule_once(lambda dt: self._after_perms(), 0)
-
             request_permissions([Permission.WRITE_EXTERNAL_STORAGE,
-                                 Permission.READ_EXTERNAL_STORAGE], _granted)
+                                 Permission.READ_EXTERNAL_STORAGE])
             _log("perms: requested")
         except Exception:
             _log("perms: unavailable (harmless)")
+            return
+        # المستخدم يحتاج وقتًا للرد على الحوار؛ نستطلع بدل انتظار رد نداء
+        for delay in (3.0, 8.0, 15.0):
+            Clock.schedule_once(lambda dt: self._after_perms(), delay)
 
     def _after_perms(self):
         """
@@ -868,6 +874,7 @@ class TGStoriesApp(App):
         """
         try:
             if refresh_download_dir():
+                _log("perms: downloads now at %s" % DOWNLOAD_DIR)
                 self.show_path()
         except Exception:
             _log("perms: re-resolve failed")
