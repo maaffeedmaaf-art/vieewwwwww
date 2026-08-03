@@ -1,71 +1,153 @@
-"""
-Stubs Kivy so main.py can be imported on a plain CI runner.
+name: Build APK
 
-main.py imports Kivy at module scope, and Kivy needs a display and a long
-list of system libraries. None of the logic under test touches the widget
-toolkit, so we install lightweight fakes into sys.modules before import.
-"""
-import os
-import sys
-import types
-from pathlib import Path
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
 
-ROOT = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(ROOT))
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
 
+    # p4a keeps TWO separate python recipes and both default to 3.14.2.
+    # Pinning only python3 leaves hostpython3 at 3.14 -> host/target
+    # mismatch. Recipe.version reads VERSION_<name>, so pin both here.
+    env:
+      VERSION_python3: '3.12.11'
+      VERSION_hostpython3: '3.12.11'
 
-class FakeWidget:
-    """Accepts any constructor kwargs and any attribute assignment."""
+    steps:
+      - uses: actions/checkout@v7
 
-    def __init__(self, **kw):
-        self.__dict__.update(kw)
-        self.text = kw.get("text", "")
-        self.values = kw.get("values", [])
-        self.children = []
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.11'
 
-    def bind(self, **kw):
-        pass
+      # Vendored, not in requirements: buildozer splits on "==" and stores
+      # the version in an env var only recipes read. python-bidi has no
+      # recipe, so the 0.4.2 pin would be dropped and pip would fetch the
+      # Rust-based 0.5+ which cannot build for Android.
+      - name: Vendor Arabic libraries
+        run: |
+          pip download "python-bidi==0.4.2" "arabic_reshaper==3.0.1" six \
+            --no-deps -d /tmp/wh -q
+          for w in /tmp/wh/*.whl; do unzip -q -o "$w" -d .; done
+          rm -rf ./*.dist-info
+          find . -name __pycache__ -type d -prune -exec rm -rf {} +
+          ls -d bidi arabic_reshaper
 
-    def add_widget(self, widget):
-        self.children.append(widget)
+      - name: Fetch Arabic font
+        run: |
+          mkdir -p assets
+          if [ ! -f assets/NotoNaskhArabic-Regular.ttf ]; then
+            curl -fsSL -o assets/NotoNaskhArabic-Regular.ttf \
+              "https://raw.githubusercontent.com/notofonts/notofonts.github.io/main/fonts/NotoNaskhArabic/hinted/ttf/NotoNaskhArabic-Regular.ttf"
+          fi
+          ls -l assets/
 
+      - name: Early checks
+        run: |
+          echo "=== FILES IN REPO ROOT ==="
+          ls -la
+          echo "=== main.py first line ==="
+          head -1 main.py || echo "MISSING main.py"
+          echo "=== buildozer.spec key lines ==="
+          grep -nE "^requirements|^android\.(ndk|ndk_api|minapi|api|archs)" buildozer.spec
+          echo "=== check 1 - main.py syntax ==="
+          python -c "import ast,io; ast.parse(io.open('main.py',encoding='utf-8').read()); print('main.py parses OK')"
+          echo "=== check 2 - vendored arabic libs ==="
+          python -c "import sys; sys.path.insert(0,'.'); import arabic_reshaper; from bidi.algorithm import get_display; print('arabic libs OK')"
+          echo "=== check 3 - python pinned to 3.12 ==="
+          grep -q "python3==3.12" buildozer.spec && echo "python pin OK" || { echo "::error::buildozer.spec missing python3==3.12 pin"; exit 1; }
+          echo "=== check 4 - ndk pinned to 25 ==="
+          grep -qE "^android\.ndk = 25" buildozer.spec && echo "ndk pin OK" || { echo "::error::buildozer.spec missing android.ndk = 25b"; exit 1; }
+          echo "=== check 5 - ndk_api is 26 ==="
+          grep -qE "^android\.ndk_api = 26" buildozer.spec && echo "ndk_api OK" || { echo "::error::ndk_api must be 26; setgrent is undeclared below API 26"; exit 1; }
+          echo "=== ALL CHECKS PASSED ==="
 
-class FakeClock:
-    @staticmethod
-    def schedule_once(fn, timeout=0):
-        fn(0)
+      - name: Free disk space
+        run: |
+          df -h /
+          # NOTE: /usr/local/lib/android is deliberately NOT removed.
+          # ANDROID_SDK_ROOT points there; deleting it can confuse tooling.
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/share/swift \
+                      /usr/local/share/powershell \
+                      /opt/hostedtoolcache/CodeQL || true
+          sudo apt-get clean
+          df -h /
 
+      - name: System dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            git zip unzip openjdk-17-jdk autoconf libtool pkg-config \
+            zlib1g-dev libncurses-dev libtinfo6 cmake libffi-dev \
+            libssl-dev build-essential ccache libltdl-dev
 
-def _module(name, **attrs):
-    mod = types.ModuleType(name)
-    for key, value in attrs.items():
-        setattr(mod, key, value)
-    sys.modules[name] = mod
-    return mod
+      - name: Cache SDK and NDK
+        uses: actions/cache@v6
+        with:
+          path: ~/.buildozer
+          key: sdk-ndk-${{ runner.os }}-ndk25b
 
+      - name: Cache compiled recipes
+        uses: actions/cache@v6
+        with:
+          path: .buildozer
+          key: recipes-${{ runner.os }}-py31211-ndk25b-${{ hashFiles('buildozer.spec') }}
 
-def _install_kivy_stubs():
-    for pkg in ("kivy", "kivy.uix", "kivy.core"):
-        _module(pkg)
-    _module("kivy.app",
-            App=type("App", (), {"get_running_app": staticmethod(lambda: None)}))
-    _module("kivy.clock", Clock=FakeClock)
-    _module("kivy.core.text",
-            LabelBase=type("LabelBase", (),
-                           {"register": staticmethod(lambda *a, **k: None)}),
-            DEFAULT_FONT="Roboto")
-    _module("kivy.core.window", Window=types.SimpleNamespace())
-    _module("kivy.metrics", dp=lambda value: value)
-    _module("kivy.uix.boxlayout", BoxLayout=FakeWidget)
-    _module("kivy.uix.button", Button=FakeWidget)
-    _module("kivy.uix.label", Label=FakeWidget)
-    _module("kivy.uix.screenmanager", Screen=FakeWidget,
-            ScreenManager=FakeWidget, SlideTransition=lambda **k: None)
-    _module("kivy.uix.scrollview", ScrollView=FakeWidget)
-    _module("kivy.uix.spinner", Spinner=FakeWidget)
-    _module("kivy.uix.textinput", TextInput=FakeWidget)
+      - name: Install buildozer
+        run: |
+          python -m pip install --upgrade pip wheel
+          pip install buildozer==1.5.0 cython==0.29.36
 
+      - name: Build APK
+        run: |
+          export JAVA_HOME=$(dirname $(dirname $(readlink -f $(which javac))))
+          # No 'yes |' and no pipefail. When buildozer exits it closes the
+          # pipe, 'yes' dies from SIGPIPE with status 141, and pipefail then
+          # reports a false failure even though the APK built fine.
+          # android.accept_sdk_license = True already answers the prompt.
+          buildozer -v android debug 2>&1 | tee build.log
+          echo "=== bin/ ==="
+          ls -la bin/ || true
+          # Trust the artifact, not the exit code.
+          ls bin/*.apk >/dev/null 2>&1 || { echo "::error::No APK was produced"; exit 1; }
 
-# ANDROID_ARGUMENT must be absent so main.py takes the desktop code path
-os.environ.pop("ANDROID_ARGUMENT", None)
-_install_kivy_stubs()
+      - name: Extract errors
+        if: failure()
+        run: |
+          if [ -f build.log ]; then
+            sed -r 's/\x1b\[[0-9;]*[a-zA-Z]//g' build.log > clean.log
+            {
+              echo "===== FAILURE CONTEXT ====="
+              grep -n -A30 -m3 -E "^STDERR:|Error compiling|fatal error:|error: |No space left" clean.log | head -150
+              echo
+              echo "===== LAST 120 REAL LINES (env dump removed) ====="
+              grep -vE "^#[[:space:]]+[A-Za-z_0-9]+ = " clean.log | tail -120
+            } > errors.txt
+            gzip -c clean.log > build-log.gz
+          else
+            echo "Build never started - see the Early checks step above." > errors.txt
+          fi
+          cat errors.txt
+
+      - name: Upload error log
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: build-errors
+          path: |
+            errors.txt
+            build-log.gz
+          retention-days: 14
+          if-no-files-found: warn
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v7
+        with:
+          name: tgstories-apk
+          path: bin/*.apk
+          if-no-files-found: error
+          retention-days: 30
